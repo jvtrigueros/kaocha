@@ -46,7 +46,11 @@
       (try
         (loop [reload []]
           (run! reload-file! reload)
-          (test/run config)
+          (try
+            (test/run config)
+            (catch Throwable t
+              (println "Failure in test runner:" t)
+              (.printStackTrace t)))
           (let [f (<!! watch-chan)]
             (recur (into #{} (cons f (take-while identity (repeatedly #(poll! watch-chan))))))))
         (catch Throwable t

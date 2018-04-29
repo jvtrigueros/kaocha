@@ -1,4 +1,5 @@
 {:suites [{:id :unit
            :test-paths ["test/unit"]}
           {:id :integration
-           :test-paths ["test/integration"]}]}
+           :test-paths ["test/integration"]}]
+ :fail-fast true}

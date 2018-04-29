@@ -30,9 +30,15 @@
     test-nss))
 
 (defn test-vars [ns]
-  (filter (comp :test meta) (vals (ns-interns (find-ns ns)))))
+  (->> (find-ns ns)
+       ns-interns
+       vals
+       (filter (comp :test meta))
+       (map #(hash-map :type :var
+                       :var %))))
 
 (defn find-tests [suite]
-  (assoc suite :tests (into {}
-                            (map (juxt identity test-vars))
-                            (load-tests suite))))
+  (assoc suite :tests (map #(hash-map :type :ns
+                                      :ns %
+                                      :tests (test-vars %))
+                           (load-tests suite))))

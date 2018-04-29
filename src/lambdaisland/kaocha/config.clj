@@ -8,7 +8,7 @@
             [lambdaisland.kaocha :as k]))
 
 (def global-opts #{:reporter :color :randomize :seed :suites :only-suites :fail-fast :watch})
-(def suite-opts #{:id :source-paths :test-paths :ns-patterns})
+(def suite-opts #{:id :type :source-paths :test-paths :ns-patterns})
 
 (defn default-config []
   (read-string (slurp (io/resource "lambdaisland/kaocha/default_config.edn"))))
@@ -68,4 +68,4 @@
     (-> global
         (update :suites (fn [suites]
                           (->> suites
-                               (mapv (partial merge suite))))))))
+                               (mapv (partial merge {:type :suite} suite))))))))

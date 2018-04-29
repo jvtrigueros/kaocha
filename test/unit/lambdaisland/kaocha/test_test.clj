@@ -3,7 +3,7 @@
             [lambdaisland.kaocha.test :refer :all]
             [lambdaisland.kaocha.test-util :refer [with-out-err]]))
 
-(deftest run-test
+(deftest run--test
   (testing "allows API usage"
     (let [config {:suites [{:id :unit
                             :test-paths ["fixtures/a-tests"]}]}]

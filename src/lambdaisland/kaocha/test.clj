@@ -7,12 +7,8 @@
             [lambdaisland.kaocha.config :as config]
             [slingshot.slingshot :refer [try+ throw+]]
             [lambdaisland.kaocha :as k]
-            [clojure.string :as str]))
-
-(def ^:private empty-report {:test 0 :pass 0 :fail 0 :error 0})
-
-(defn- merge-report [r1 r2]
-  (merge-with #(if (int? %1) (+ %1 %2) %2) empty-report r1 r2))
+            [clojure.string :as str]
+            [lambdaisland.kaocha.output :as out]))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; clojure.test functions
@@ -46,75 +42,94 @@
                          (merge (stacktrace-file-and-line (.getStackTrace ^Throwable (:actual m))) m))
                        m)))))
 
-(defn test-var
-  "If v has a function in its :test metadata, calls that function,
-  with *testing-vars* bound to (conj *testing-vars* v)."
-  [v]
-  (when-let [t (:test (meta v))]
-    (binding [t/*testing-vars* (conj t/*testing-vars* v)]
-      (t/do-report {:type :begin-test-var, :var v})
-      (t/inc-report-counter :test)
-      (try+
-       (t)
-       (catch ::k/fail-fast m
-         (t/do-report {:type :end-test-var, :var v})
-         (throw+ m))
-       (catch Throwable e
-         (t/do-report {:type :error, :message "Uncaught exception, not in assertion."
-                       :expected nil, :actual e})))
-      (t/do-report {:type :end-test-var, :var v}))))
 
-(defn test-vars
-  "Groups vars by their namespace and runs test-vars on them with
-   appropriate fixtures applied."
-  [vars]
-  (doseq [[ns vars] (group-by (comp :ns meta) vars)]
-    (let [once-fixture-fn (t/join-fixtures (::once-fixtures (meta ns)))
-          each-fixture-fn (t/join-fixtures (::each-fixtures (meta ns)))]
-      (once-fixture-fn
-       (fn []
-         (doseq [v vars]
-           (when (:test (meta v))
-             (each-fixture-fn (fn [] (test-var v))))))))))
+(defn- rollup [results]
+  (if-let [tests (:tests results)]
+    (rollup tests)
+    (into {}
+          (map (juxt identity (fn [k]
+                                (transduce (map #(k % 0)) + results))))
+          [:test :fail :pass :error])))
 
-(defn test-ns [ns vars]
+(declare run-tests)
+
+(defmulti run-test :type)
+
+(defmethod run-test :default [testable]
+  (output/warn "No implementation of" `run-test "for" testable))
+
+(defmethod run-test :suite [suite]
+  (t/do-report {:type :begin-test-suite :testable suite})
+  (let [result (run-tests (:tests suite))
+        suite' (cond-> (assoc suite :tests result)
+                 (::k/fail-fast (meta result)) (assoc ::k/fail-fast true))]
+    (t/do-report {:type :end-test-suite :testable suite'})
+    suite'))
+
+(defmethod run-test :ns [{:keys [ns tests] :as testable}]
+  (let [ns-obj (the-ns ns)]
+    (t/do-report {:type :begin-test-ns
+                  :ns ns-obj
+                  :testable testable})
+    ;; If the namespace has a test-ns-hook function, call that:
+    (if-let [v (find-var (symbol (str (ns-name ns-obj)) "test-ns-hook"))]
+	    ((var-get v))
+      ;; Otherwise, just test every var in the namespace.
+      (let [once-fixture-fn (t/join-fixtures (::once-fixtures (meta ns)))
+            each-fixture-fn (t/join-fixtures (::each-fixtures (meta ns)))
+            result (once-fixture-fn
+                    (fn []
+                      (->> tests
+                           (map #(assoc % :each-fixture-fn each-fixture-fn))
+                           run-tests
+                           (map #(dissoc % :each-fixture-fn)))))
+            testable' (assoc testable :tests result)]
+        (t/do-report {:type :end-test-ns
+                      :ns ns-obj
+                      :testable testable})
+        testable'))))
+
+(defmethod run-test :var [{:keys [var each-fixture-fn]
+                           :or {each-fixture-fn #(%)}
+                           :as testable}]
   (binding [t/*report-counters* (ref t/*initial-report-counters*)]
-    (let [ns-obj (the-ns ns)]
-      (t/do-report {:type :begin-test-ns, :ns ns-obj})
-      ;; If the namespace has a test-ns-hook function, call that:
-      (if-let [v (find-var (symbol (str (ns-name ns-obj)) "test-ns-hook"))]
-	      ((var-get v))
-        ;; Otherwise, just test every var in the namespace.
-        (test-vars vars))
-      (t/do-report {:type :end-test-ns, :ns ns-obj}))
-    @t/*report-counters*))
+    (when-let [t (:test (meta var))]
+      (binding [t/*testing-vars* (conj t/*testing-vars* var)]
+        (t/do-report {:type :begin-test-var, :var var})
+        (t/inc-report-counter :test)
+        (try+
+         (each-fixture-fn t)
+         (catch ::k/fail-fast m
+           (t/do-report {:type :end-test-var, :var var})
+           (throw+ m))
+         (catch Throwable e
+           (t/do-report {:type :error, :message "Uncaught exception, not in assertion."
+                         :expected nil, :actual e})))
+        (t/do-report {:type :end-test-var, :var var})
+        (merge testable @t/*report-counters*)
+        ))))
 
-(defn try-test-ns [ns+vars]
+(defn try-run-test [testable]
   (try+
-   (apply test-ns ns+vars)
+   (run-test testable)
    (catch ::k/fail-fast m
      m)))
 
-(defn run-tests [namespaces]
-  (loop [[ns+vars & nss] namespaces
-         report {}]
-    (if ns+vars
-      (let [ns-report (try-test-ns ns+vars)]
-        (if (::k/fail-fast ns-report)
-          (recur [] (merge-report report ns-report))
-          (recur nss (merge-report report ns-report))))
+(defn run-tests [tests]
+  (loop [[testable & tests] tests
+         report             []]
+    (if testable
+      (let [test-result (try-run-test testable)
+            report      (conj report (merge testable test-result))]
+        (if (::k/fail-fast test-result)
+          (recur [] (with-meta (concat report tests) {::k/fail-fast true}))
+          (recur tests report)))
       report)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defmacro ^:private with-reporter [r & body]
   `(with-redefs [t/report ~r]
      ~@body))
-
-(defn- run-suite [{:keys [tests] :as suite}]
-  (t/do-report (assoc suite :type :begin-test-suite))
-  (let [report (run-tests tests)]
-    (t/do-report (assoc suite :type :end-test-suite))
-    report))
 
 (defn result->report [results]
   (reduce (fn [r {type :type}]
@@ -125,16 +140,39 @@
           {:test 0 :pass 0 :fail 0 :error 0}
           results))
 
+(defn test-plan
+  "This loads and finds test namespaces and vars, and adds them to the config.
+  From this point on the config is referred as the test plan."
+  [config]
+  (let [{:keys [only-suites suites randomize seed]} config]
+    (assoc config
+           :suites
+           (->> suites
+                (config/filter-suites only-suites)
+                (map load/find-tests)))))
+
+(defn add-random-seed [test-plan]
+  (if (and (:randomize test-plan) (nil? (:seed test-plan)))
+    (assoc test-plan :seed (rand-int (Integer/MAX_VALUE)))
+    test-plan))
+
+(defn randomize-tests [{:keys [randomize seed] :as test-plan}]
+  (if randomize
+    (update test-plan
+            :suites
+            (fn [suites]
+              (map #(update % :tests (partial random/randomize-tests seed)) suites)))
+    test-plan))
+
 (defn run [config]
-  (let [{:keys [reporter
-                color
-                suites
-                only-suites
-                fail-fast
-                seed
-                randomize]} (config/normalize config)
-        seed                (or seed (rand-int Integer/MAX_VALUE))
-        suites              (config/filter-suites only-suites suites)
+  (let [test-plan           (-> config
+                                config/normalize
+                                test-plan
+                                add-random-seed
+                                randomize-tests)
+        reporter            (:reporter test-plan)
+        color               (:color test-plan)
+        fail-fast           (:fail-fast test-plan)
         reporter            (config/resolve-reporter
                              (if fail-fast
                                [reporter report/fail-fast]
@@ -152,22 +190,71 @@
                               (.removeShutdownHook runtime on-shutdown)
                               report)]
     (.addShutdownHook runtime on-shutdown)
-    (when randomize
-      (println "Running with --seed" seed))
+    (when (:randomize test-plan)
+      (println "Running with --seed" (:seed test-plan)))
     (try
       (with-reporter reporter
         (binding [output/*colored-output* color
                   report/*results*        results]
-          (let [suites (cond->> (map load/find-tests suites)
-                         randomize (map #(update % :tests (partial random/randomize-tests seed))))]
-            (loop [[suite & suites] suites
-                   report           {}]
-              (if suite
-                (let [report (merge-report report (run-suite suite))]
-                  (if (::k/fail-fast report)
-                    (do
-                      (recur [] report))
-                    (recur suites report)))
-                (do-finish report))))))
+          (let [results (run-tests (:suites test-plan))]
+            (do-finish (rollup results)))))
       (finally
         (.removeShutdownHook runtime on-shutdown)))))
+
+(comment
+  (->> "tests.edn"
+       config/load-config
+       config/normalize
+       test-plan
+       #_:suites
+       #_first
+       #_run-test)
+
+  (-> "tests.edn"
+      config/load-config
+      (assoc :suites [{:type :suite
+                       :tests
+                       [{:type :ns
+                         :ns (find-ns 'lambdaisland.kaocha.config-test)
+                         :tests
+                         [{:type :var
+                           :var #'lambdaisland.kaocha.config-test/resolve-reporter}]}]}])
+      run)
+
+  (with-redefs [t/report (config/resolve-reporter ['lambdaisland.kaocha.report/dots
+                                                   'lambdaisland.kaocha.report/fail-fast])]
+    (run-test {:type :var, :var #'lambdaisland.kaocha.config-test/normalize-test}))
+
+  #_=>
+  {:type :var, :var #'lambdaisland.kaocha.config-test/resolve-reporter, :test 1, :pass 0, :fail 0, :error 1}
+
+  (run-test
+   {:type :ns
+    :ns 'lambdaisland.kaocha.config-test
+    :tests [{:type :var, :var #'lambdaisland.kaocha.config-test/resolve-reporter}
+            {:type :var, :var #'lambdaisland.kaocha.config-test/normalize-test}]})
+
+  #_=>
+
+  ;; {:type :ns,
+  ;;  :ns lambdaisland.kaocha.config-test,
+  ;;  :tests [{:type :var,
+  ;;          :var #'lambdaisland.kaocha.config-test/resolve-reporter,
+  ;;          :each-fixture-fn #function[clojure.test/default-fixture],
+  ;;          :test 1,
+  ;;          :pass 7,
+  ;;          :fail 0,
+  ;;          :error 0}
+  ;;         {:type :var,
+  ;;          :var #'lambdaisland.kaocha.config-test/normalize-test,
+  ;;          :each-fixture-fn #function[clojure.test/default-fixture],
+  ;;          :test 1,
+  ;;          :pass 0,
+  ;;          :fail 1,
+  ;;          :error 0}],
+  ;;  :test 2,
+  ;;  :fail 1,
+  ;;  :pass 7,
+  ;;  :error 0}
+
+  )

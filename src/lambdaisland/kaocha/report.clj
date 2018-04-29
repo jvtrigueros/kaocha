@@ -71,6 +71,7 @@
   as a failure or error is encountered."
   [m]
   (when (contains? #{:fail :error} (:type m))
+    (prn [:fail-fast m])
     (throw+ (assoc @t/*report-counters* ::k/fail-fast true))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
