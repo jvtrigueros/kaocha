@@ -1,4 +1,4 @@
 .cpcache
 .nrepl-port
 target
-repl
+.cljs_rhino_repl
